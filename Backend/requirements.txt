@@ -4,12 +4,8 @@ detoxify
 httpx
 beautifulsoup4
 pydantic
-
-
-for fresh env:
-python -m venv venv           # if you haven’t created it yet
-# — or — conda create -n tox-api python=3.10 -y
-#   then conda activate tox-api
-
-# activate your venv first, then:
-pip install -r requirements.txt
+Pillow
+transformers
+torch
+requests
+python-dotenv
