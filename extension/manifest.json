@@ -1,19 +1,29 @@
 {
-    "manifest_version": 3,
-    "name": "Site Safety Monitor",
-    "version": "1.0",
-    "description": "Warn users if a site’s content is classified as harmful.",
-    "permissions": [
-      "scripting",
-      "tabs",
-      "webNavigation"
-    ],
-    "host_permissions": [
-      "<all_urls>",
-      "http://localhost:8000/*"
-    ],
-    "background": {
-      "service_worker": "background.js"
+  "manifest_version": 3,
+  "name": "Site Safety Monitor",
+  "version": "1.0",
+  "description": "Warn users if a site's content is classified as harmful.",
+  "permissions": [
+    "scripting",
+    "tabs",
+    "webNavigation"
+  ],
+  "host_permissions": [
+    "<all_urls>",
+    "http://localhost:8000/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "<all_urls>"
+      ],
+      "js": [
+        "contentScript.js"
+      ],
+      "run_at": "document_idle"
     }
-  }
-  
+  ]
+}
