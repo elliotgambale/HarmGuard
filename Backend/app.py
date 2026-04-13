@@ -31,6 +31,8 @@ HARMFUL_THRESHOLD = 0.4
 VT_FLAG_THRESHOLD = 1.5
 IMAGE_TIMEOUT = 10
 YOUNG_CERT_DAYS = 7
+TEXT_CHUNK_CHARS = 600
+TEXT_CHUNK_LIMIT = 12
 IMAGE_UNSAFE_LABELS = {
     "nsfw",
     "unsafe",
@@ -145,21 +147,52 @@ def collect_image_sources(img, page_url: str) -> list[str]:
 
 
 def score_text_toxicity(text: str) -> dict[str, object]:
-    raw_results = detox.predict(text)
-    results: dict[str, float] = {}
-    for key, value in raw_results.items():
-        try:
-            results[key] = float(value.item())
-        except AttributeError:
-            results[key] = float(value)
+    cleaned = re.sub(r"\s+", " ", text).strip()
+    if not cleaned:
+        return {
+            "score": 0.0,
+            "flagged": False,
+            "details": {
+                "threshold": TEXT_THRESHOLD,
+                "chunks_scored": 0,
+                "all_scores": {},
+            },
+        }
 
-    score = results.get("toxicity", results.get("toxic", 0.0))
+    chunks: list[str] = []
+    for start in range(0, min(len(cleaned), MAX_TEXT_CHARS), TEXT_CHUNK_CHARS):
+        chunk = cleaned[start : start + TEXT_CHUNK_CHARS].strip()
+        if chunk:
+            chunks.append(chunk)
+        if len(chunks) >= TEXT_CHUNK_LIMIT:
+            break
+
+    chunk_scores: list[float] = []
+    peak_results: dict[str, float] = {}
+    for chunk in chunks:
+        raw_results = detox.predict(chunk)
+        normalized_results: dict[str, float] = {}
+        for key, value in raw_results.items():
+            try:
+                normalized_results[key] = float(value.item())
+            except AttributeError:
+                normalized_results[key] = float(value)
+
+        for key, value in normalized_results.items():
+            peak_results[key] = max(peak_results.get(key, 0.0), value)
+        chunk_scores.append(normalized_results.get("toxicity", normalized_results.get("toxic", 0.0)))
+
+    sorted_scores = sorted(chunk_scores, reverse=True)
+    top_scores = sorted_scores[:3]
+    score = max(top_scores) if len(top_scores) == 1 else sum(top_scores) / len(top_scores)
     return {
         "score": score,
         "flagged": score >= TEXT_THRESHOLD,
         "details": {
             "threshold": TEXT_THRESHOLD,
-            "all_scores": results,
+            "chunks_scored": len(chunks),
+            "top_chunk_scores": [round(value, 3) for value in top_scores],
+            "all_scores": peak_results,
         },
     }
 
