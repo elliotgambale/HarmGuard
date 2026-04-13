@@ -35,9 +35,20 @@ YOUNG_CERT_DAYS = 7
 SCRIPT_PATTERNS = {
     "base64_eval": re.compile(r"eval\s*\(\s*atob\s*\(", re.IGNORECASE),
     "crypto_miner": re.compile(r"(?:coinhive|cryptominer)", re.IGNORECASE),
-    "char_code_obfuscation": re.compile(r"fromCharCode", re.IGNORECASE),
+    "char_code_obfuscation": re.compile(
+        r"fromCharCode\s*\(\s*(?:\d+\s*,\s*){7,}\d+\s*\)",
+        re.IGNORECASE,
+    ),
     "keylogging_fetch": re.compile(r"onkeypress[\s\S]{0,200}?fetch", re.IGNORECASE),
     "dynamic_function": re.compile(r"new\s+Function\s*\(", re.IGNORECASE),
+}
+
+SCRIPT_PATTERN_WEIGHTS = {
+    "base64_eval": 0.6,
+    "crypto_miner": 1.0,
+    "char_code_obfuscation": 0.2,
+    "keylogging_fetch": 0.8,
+    "dynamic_function": 0.35,
 }
 
 WEIGHTS = {
@@ -148,28 +159,41 @@ def score_images(soup: BeautifulSoup, page_url: str) -> dict[str, object]:
 
 
 def score_scripts(soup: BeautifulSoup) -> dict[str, object]:
-    hits = 0
+    weighted_hits = 0.0
     pattern_hits: dict[str, int] = {name: 0 for name in SCRIPT_PATTERNS}
     scripts_scanned = 0
+    suspicious_scripts = 0
 
     for script in soup.find_all("script"):
         script_text = script.get_text(" ", strip=True)
         if not script_text:
             continue
         scripts_scanned += 1
+        script_weight = 0.0
         for name, pattern in SCRIPT_PATTERNS.items():
             match_count = len(pattern.findall(script_text))
             if match_count:
                 pattern_hits[name] += match_count
-                hits += match_count
+                script_weight += match_count * SCRIPT_PATTERN_WEIGHTS[name]
+        if script_weight > 0:
+            suspicious_scripts += 1
+            weighted_hits += min(script_weight, 1.0)
 
-    score = min(hits / 3, 1.0)
+    score = min(weighted_hits / 2.5, 1.0)
+    strong_script_signal = (
+        pattern_hits["base64_eval"] > 0
+        or pattern_hits["crypto_miner"] > 0
+        or pattern_hits["keylogging_fetch"] > 0
+        or (pattern_hits["dynamic_function"] > 0 and pattern_hits["char_code_obfuscation"] > 0)
+    )
     return {
         "score": score,
-        "flagged": hits > 0,
+        "flagged": strong_script_signal or score >= 0.55,
         "details": {
             "scripts_scanned": scripts_scanned,
-            "total_pattern_hits": hits,
+            "suspicious_scripts": suspicious_scripts,
+            "weighted_hits": round(weighted_hits, 3),
+            "total_pattern_hits": sum(pattern_hits.values()),
             "pattern_hits": pattern_hits,
         },
     }
