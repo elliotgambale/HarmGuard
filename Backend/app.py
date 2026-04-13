@@ -31,8 +31,11 @@ HARMFUL_THRESHOLD = 0.4
 VT_FLAG_THRESHOLD = 1.5
 IMAGE_TIMEOUT = 10
 YOUNG_CERT_DAYS = 7
-TEXT_CHUNK_CHARS = 600
+TEXT_CHUNK_TARGET_CHARS = 600
+TEXT_CHUNK_MIN_CHARS = 250
 TEXT_CHUNK_LIMIT = 12
+TEXT_CHUNK_OVERLAP_SENTENCES = 1
+DEDUPLICATION_MIN_SENTENCE_CHARS = 20
 IMAGE_UNSAFE_LABELS = {
     "nsfw",
     "unsafe",
@@ -109,6 +112,145 @@ class URLRequest(BaseModel):
     url: str
 
 
+def normalize_page_text(text: str) -> str:
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def split_sentences(text: str) -> list[str]:
+    pieces = re.split(r"(?<=[.!?])\s+|\n+", text)
+    sentences = [piece.strip() for piece in pieces if piece and piece.strip()]
+    return sentences or ([text.strip()] if text.strip() else [])
+
+
+def split_long_sentence(sentence: str, max_chars: int) -> list[str]:
+    words = sentence.split()
+    if not words:
+        return []
+
+    parts: list[str] = []
+    current_words: list[str] = []
+    current_length = 0
+
+    for word in words:
+        projected_length = current_length + len(word) + (1 if current_words else 0)
+        if current_words and projected_length > max_chars:
+            parts.append(" ".join(current_words))
+            current_words = [word]
+            current_length = len(word)
+            continue
+
+        current_words.append(word)
+        current_length = projected_length
+
+    if current_words:
+        parts.append(" ".join(current_words))
+    return parts
+
+
+def canonicalize_sentence_for_dedupe(sentence: str) -> str:
+    normalized = sentence.lower()
+    normalized = re.sub(r"https?://\S+", " ", normalized)
+    normalized = re.sub(r"[^\w\s]", " ", normalized)
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+    return normalized
+
+
+def dedupe_sentences(sentences: list[str]) -> tuple[list[str], int]:
+    unique_sentences: list[str] = []
+    seen: set[str] = set()
+    duplicates_removed = 0
+
+    for sentence in sentences:
+        canonical = canonicalize_sentence_for_dedupe(sentence)
+        if len(canonical) >= DEDUPLICATION_MIN_SENTENCE_CHARS and canonical in seen:
+            duplicates_removed += 1
+            continue
+
+        if len(canonical) >= DEDUPLICATION_MIN_SENTENCE_CHARS:
+            seen.add(canonical)
+        unique_sentences.append(sentence)
+
+    return unique_sentences, duplicates_removed
+
+
+def build_text_chunks(text: str) -> tuple[list[str], dict[str, int]]:
+    cleaned = normalize_page_text(text)
+    if not cleaned:
+        return [], {
+            "raw_sentence_count": 0,
+            "unique_sentence_count": 0,
+            "duplicate_sentences_removed": 0,
+        }
+
+    prepared_sentences: list[str] = []
+    for sentence in split_sentences(cleaned):
+        if len(sentence) <= TEXT_CHUNK_TARGET_CHARS:
+            prepared_sentences.append(sentence)
+            continue
+        prepared_sentences.extend(split_long_sentence(sentence, TEXT_CHUNK_TARGET_CHARS))
+
+    sentences, duplicates_removed = dedupe_sentences(prepared_sentences)
+
+    if not sentences:
+        return [], {
+            "raw_sentence_count": len(prepared_sentences),
+            "unique_sentence_count": 0,
+            "duplicate_sentences_removed": duplicates_removed,
+        }
+
+    chunks: list[str] = []
+    start_index = 0
+
+    while start_index < len(sentences):
+        chunk_sentences: list[str] = []
+        chunk_length = 0
+        index = start_index
+
+        while index < len(sentences):
+            sentence = sentences[index]
+            projected_length = chunk_length + len(sentence) + (1 if chunk_sentences else 0)
+            if chunk_sentences and projected_length > TEXT_CHUNK_TARGET_CHARS:
+                break
+
+            chunk_sentences.append(sentence)
+            chunk_length = projected_length
+            index += 1
+
+            if chunk_length >= TEXT_CHUNK_MIN_CHARS:
+                break
+
+        if not chunk_sentences:
+            start_index += 1
+            continue
+
+        chunks.append(" ".join(chunk_sentences).strip())
+        if index >= len(sentences):
+            break
+
+        next_start = index - TEXT_CHUNK_OVERLAP_SENTENCES
+        start_index = next_start if next_start > start_index else index
+
+    return chunks, {
+        "raw_sentence_count": len(prepared_sentences),
+        "unique_sentence_count": len(sentences),
+        "duplicate_sentences_removed": duplicates_removed,
+    }
+
+
+def select_representative_chunks(chunks: list[str], limit: int) -> list[str]:
+    if len(chunks) <= limit:
+        return chunks
+
+    selected_indices: list[int] = []
+    last_index = len(chunks) - 1
+    for slot in range(limit):
+        index = round(slot * last_index / (limit - 1))
+        if not selected_indices or index != selected_indices[-1]:
+            selected_indices.append(index)
+
+    return [chunks[index] for index in selected_indices]
+
+
 def normalize_url(raw_url: str) -> str:
     if re.match(r"^https?://", raw_url, re.IGNORECASE):
         return raw_url
@@ -147,7 +289,7 @@ def collect_image_sources(img, page_url: str) -> list[str]:
 
 
 def score_text_toxicity(text: str) -> dict[str, object]:
-    cleaned = re.sub(r"\s+", " ", text).strip()
+    cleaned = normalize_page_text(text)
     if not cleaned:
         return {
             "score": 0.0,
@@ -159,13 +301,9 @@ def score_text_toxicity(text: str) -> dict[str, object]:
             },
         }
 
-    chunks: list[str] = []
-    for start in range(0, min(len(cleaned), MAX_TEXT_CHARS), TEXT_CHUNK_CHARS):
-        chunk = cleaned[start : start + TEXT_CHUNK_CHARS].strip()
-        if chunk:
-            chunks.append(chunk)
-        if len(chunks) >= TEXT_CHUNK_LIMIT:
-            break
+    full_text = cleaned[:MAX_TEXT_CHARS]
+    built_chunks, chunk_stats = build_text_chunks(full_text)
+    chunks = select_representative_chunks(built_chunks, TEXT_CHUNK_LIMIT)
 
     chunk_scores: list[float] = []
     peak_results: dict[str, float] = {}
@@ -191,6 +329,8 @@ def score_text_toxicity(text: str) -> dict[str, object]:
         "details": {
             "threshold": TEXT_THRESHOLD,
             "chunks_scored": len(chunks),
+            "chunking_strategy": "sentence_windows_even_sampling_with_sentence_dedupe",
+            **chunk_stats,
             "top_chunk_scores": [round(value, 3) for value in top_scores],
             "all_scores": peak_results,
         },
@@ -509,7 +649,7 @@ async def analyze(request: URLRequest):
         raise HTTPException(status_code=400, detail=f"Failed to fetch URL: {exc}") from exc
 
     soup = BeautifulSoup(response.text, "html.parser")
-    text = " ".join(soup.stripped_strings)[:MAX_TEXT_CHARS]
+    text = " ".join(soup.stripped_strings)
     interstitial_result = detect_content_interstitial(page_url, soup, text)
 
     text_result, image_result, domain_result, metadata_result = await asyncio.gather(
