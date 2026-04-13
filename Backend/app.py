@@ -25,12 +25,40 @@ logger = logging.getLogger(__name__)
 load_dotenv()
 
 MAX_TEXT_CHARS = 10000
-MAX_IMAGES = 8
+MAX_IMAGES = 16
 TEXT_THRESHOLD = 0.5
 HARMFUL_THRESHOLD = 0.4
-VT_FLAG_THRESHOLD = 3
+VT_FLAG_THRESHOLD = 1.5
 IMAGE_TIMEOUT = 10
 YOUNG_CERT_DAYS = 7
+IMAGE_UNSAFE_LABELS = {
+    "nsfw",
+    "unsafe",
+    "porn",
+    "porno",
+    "explicit",
+    "sexual",
+    "sexy",
+    "adult",
+    "erotic",
+    "hentai",
+    "nudity",
+    "nude",
+    "xxx",
+}
+IMAGE_UNSAFE_SCORE_THRESHOLD = 0.35
+INTERSTITIAL_PATTERNS = [
+    re.compile(r"\bmature content\b", re.IGNORECASE),
+    re.compile(r"\bsensitive content\b", re.IGNORECASE),
+    re.compile(r"\badult content\b", re.IGNORECASE),
+    re.compile(r"\bcontent warning\b", re.IGNORECASE),
+    re.compile(r"\bover 18\b", re.IGNORECASE),
+    re.compile(r"\b18\+\b", re.IGNORECASE),
+    re.compile(r"\bview sensitive media\b", re.IGNORECASE),
+    re.compile(r"\bmedia may contain sensitive material\b", re.IGNORECASE),
+    re.compile(r"\bthis profile may include potentially sensitive content\b", re.IGNORECASE),
+    re.compile(r"\bcontinue to view\b", re.IGNORECASE),
+]
 
 SCRIPT_PATTERNS = {
     "base64_eval": re.compile(r"eval\s*\(\s*atob\s*\(", re.IGNORECASE),
@@ -87,7 +115,33 @@ def normalize_url(raw_url: str) -> str:
 
 def label_is_unsafe(label: str) -> bool:
     normalized = label.lower()
-    return "nsfw" in normalized or "unsafe" in normalized
+    return any(token in normalized for token in IMAGE_UNSAFE_LABELS)
+
+
+def collect_image_sources(img, page_url: str) -> list[str]:
+    candidates: list[str] = []
+
+    for attr in ("src", "data-src", "data-lazy-src", "data-original", "data-image"):
+        value = (img.get(attr) or "").strip()
+        if value:
+            candidates.append(value)
+
+    srcset = (img.get("srcset") or img.get("data-srcset") or "").strip()
+    if srcset:
+        for candidate in srcset.split(","):
+            url_part = candidate.strip().split(" ")[0]
+            if url_part:
+                candidates.append(url_part)
+
+    resolved: list[str] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        full_url = urljoin(page_url, candidate)
+        if full_url in seen:
+            continue
+        seen.add(full_url)
+        resolved.append(full_url)
+    return resolved
 
 
 def score_text_toxicity(text: str) -> dict[str, object]:
@@ -110,25 +164,65 @@ def score_text_toxicity(text: str) -> dict[str, object]:
     }
 
 
+def detect_content_interstitial(page_url: str, soup: BeautifulSoup, text: str) -> dict[str, object]:
+    page_text = " ".join(
+        part for part in [
+            soup.title.get_text(" ", strip=True) if soup.title else "",
+            text[:2500],
+        ] if part
+    )
+
+    matches: list[str] = []
+    for pattern in INTERSTITIAL_PATTERNS:
+        match = pattern.search(page_text)
+        if match:
+            matches.append(match.group(0).lower())
+
+    form_controls = len(soup.find_all(["button", "form"]))
+    continues = len(
+        soup.find_all(
+            string=re.compile(r"(continue|view|yes|show|enter)", re.IGNORECASE)
+        )
+    )
+    parsed = urlparse(page_url)
+    path_hint = any(
+        token in parsed.path.lower()
+        for token in ("sensitive", "adult", "warning", "consent")
+    )
+
+    is_interstitial = len(set(matches)) >= 2 or (
+        matches and (form_controls > 0 or continues > 0 or path_hint)
+    )
+    return {
+        "detected": is_interstitial,
+        "details": {
+            "matched_phrases": sorted(set(matches)),
+            "form_controls": form_controls,
+            "continue_like_prompts": continues,
+            "path_hint": path_hint,
+        },
+    }
+
+
 def score_images(soup: BeautifulSoup, page_url: str) -> dict[str, object]:
     image_urls: list[str] = []
     seen_urls: set[str] = set()
 
     for img in soup.find_all("img"):
-        src = (img.get("src") or "").strip()
-        if not src:
-            continue
-        full_url = urljoin(page_url, src)
-        if full_url in seen_urls:
-            continue
-        seen_urls.add(full_url)
-        image_urls.append(full_url)
+        for full_url in collect_image_sources(img, page_url):
+            if full_url in seen_urls:
+                continue
+            seen_urls.add(full_url)
+            image_urls.append(full_url)
+            if len(image_urls) >= MAX_IMAGES:
+                break
         if len(image_urls) >= MAX_IMAGES:
             break
 
     unsafe_count = 0
     processed = 0
     flagged_urls: list[str] = []
+    max_unsafe_score = 0.0
 
     for image_url in image_urls:
         try:
@@ -136,23 +230,30 @@ def score_images(soup: BeautifulSoup, page_url: str) -> dict[str, object]:
             response.raise_for_status()
             image = Image.open(io.BytesIO(response.content)).convert("RGB").resize((224, 224))
             predictions = image_classifier(image)
-            top_prediction = predictions[0] if predictions else {}
-            label = str(top_prediction.get("label", ""))
-            if label_is_unsafe(label):
+            unsafe_score = 0.0
+            for prediction in predictions or []:
+                label = str(prediction.get("label", ""))
+                if label_is_unsafe(label):
+                    unsafe_score += float(prediction.get("score", 0.0))
+
+            max_unsafe_score = max(max_unsafe_score, unsafe_score)
+            if unsafe_score >= IMAGE_UNSAFE_SCORE_THRESHOLD:
                 unsafe_count += 1
                 flagged_urls.append(image_url)
             processed += 1
         except Exception as exc:
             logger.info("Image analysis skipped for %s: %s", image_url, exc)
 
-    score = unsafe_count / processed if processed else 0.0
+    ratio_score = unsafe_count / processed if processed else 0.0
+    score = max(ratio_score, max_unsafe_score)
     return {
         "score": score,
-        "flagged": score > 0.0,
+        "flagged": max_unsafe_score >= 0.6 or unsafe_count >= 2 or score >= 0.35,
         "details": {
             "images_found": len(image_urls),
             "images_processed": processed,
             "unsafe_images": unsafe_count,
+            "max_unsafe_score": round(max_unsafe_score, 3),
             "flagged_image_urls": flagged_urls,
         },
     }
@@ -376,6 +477,7 @@ async def analyze(request: URLRequest):
 
     soup = BeautifulSoup(response.text, "html.parser")
     text = " ".join(soup.stripped_strings)[:MAX_TEXT_CHARS]
+    interstitial_result = detect_content_interstitial(page_url, soup, text)
 
     text_result, image_result, domain_result, metadata_result = await asyncio.gather(
         asyncio.to_thread(score_text_toxicity, text),
@@ -384,6 +486,33 @@ async def analyze(request: URLRequest):
         asyncio.to_thread(score_metadata, page_url, soup),
     )
     script_result = score_scripts(soup)
+
+    if interstitial_result["detected"]:
+        text_result = {
+            "score": 0.0,
+            "flagged": False,
+            "details": {
+                "suppressed": True,
+                "reason": "content interstitial detected before underlying page content",
+            },
+        }
+        image_result = {
+            "score": 0.0,
+            "flagged": False,
+            "details": {
+                "suppressed": True,
+                "reason": "content interstitial detected before underlying page images",
+            },
+        }
+        script_result = {
+            "score": min(script_result["score"], 0.15),
+            "flagged": False,
+            "details": {
+                **script_result["details"],
+                "suppressed": True,
+                "reason": "content interstitial detected before underlying page scripts",
+            },
+        }
 
     breakdown = {
         "text_toxicity": text_result,
@@ -404,15 +533,35 @@ async def analyze(request: URLRequest):
     metadata_supported = metadata_result["score"] >= 0.6 and (
         script_result["flagged"] or domain_result["flagged"]
     )
-    is_harmful = strong_signal_flagged or metadata_supported or risk_score >= HARMFUL_THRESHOLD
+    medium_signal_combo = (
+        image_result["score"] >= 0.3
+        or (
+            script_result["score"] >= 0.35
+            and metadata_result["score"] >= 0.35
+        )
+        or (
+            text_result["score"] >= 0.45
+            and script_result["score"] >= 0.3
+        )
+    )
+    is_harmful = (
+        strong_signal_flagged
+        or metadata_supported
+        or medium_signal_combo
+        or risk_score >= HARMFUL_THRESHOLD
+    )
     reasons = build_reasons(breakdown)
 
     return {
         "risk_score": risk_score,
         "is_harmful": is_harmful,
         "threshold": HARMFUL_THRESHOLD,
-        "decision_rule": "strong-signal-or-supported-metadata-or-threshold",
+        "decision_rule": "strong-signal-or-medium-signal-combo-or-supported-metadata-or-threshold",
         "weights": WEIGHTS,
         "reasons": reasons,
         "breakdown": breakdown,
+        "analysis_limits": {
+            "content_interstitial_detected": interstitial_result["detected"],
+            "interstitial_details": interstitial_result["details"],
+        },
     }

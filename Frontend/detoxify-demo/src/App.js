@@ -66,7 +66,7 @@ export default function App() {
         <section className="hero-panel">
           <div className="hero-copy">
             <p className="eyebrow">Multi-signal website screening</p>
-            <h1>Website Risk Checker</h1>
+            <h1>HarmGuard</h1>
             <p className="hero-text">
               Analyze a live page across content, images, scripts, domain reputation,
               and metadata signals.

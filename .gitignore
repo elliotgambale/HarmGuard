@@ -7,4 +7,4 @@ __pycache__/
 venv/
 .venv/
 
-git add .env
+.env
