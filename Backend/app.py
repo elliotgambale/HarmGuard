@@ -30,6 +30,7 @@ TEXT_THRESHOLD = 0.5
 HARMFUL_THRESHOLD = 0.4
 VT_FLAG_THRESHOLD = 3
 IMAGE_TIMEOUT = 10
+YOUNG_CERT_DAYS = 7
 
 SCRIPT_PATTERNS = {
     "base64_eval": re.compile(r"eval\s*\(\s*atob\s*\(", re.IGNORECASE),
@@ -247,6 +248,23 @@ def get_certificate_age_days(hostname: str) -> int | None:
     return max((datetime.now(timezone.utc) - issued_at).days, 0)
 
 
+def is_suspicious_hidden_iframe(iframe, page_url: str) -> bool:
+    src = (iframe.get("src") or "").strip()
+    if not src:
+        return False
+
+    full_src = urljoin(page_url, src)
+    iframe_host = urlparse(full_src).hostname
+    page_host = urlparse(page_url).hostname
+    is_cross_origin = bool(iframe_host and page_host and iframe_host != page_host)
+
+    width = (iframe.get("width") or "").strip()
+    height = (iframe.get("height") or "").strip()
+    tiny_dimensions = width in {"0", "1"} or height in {"0", "1"}
+
+    return is_cross_origin or tiny_dimensions
+
+
 def score_metadata(page_url: str, soup: BeautifulSoup) -> dict[str, object]:
     parsed = urlparse(page_url)
     flags = {
@@ -254,30 +272,48 @@ def score_metadata(page_url: str, soup: BeautifulSoup) -> dict[str, object]:
         "hidden_iframe": False,
         "young_ssl_certificate": False,
     }
+    metadata_signals = {
+        "hidden_iframe": False,
+    }
 
     for iframe in soup.find_all("iframe"):
         style = (iframe.get("style") or "").replace(" ", "").lower()
-        if "display:none" in style or "visibility:hidden" in style or "opacity:0" in style:
-            flags["hidden_iframe"] = True
-            break
-        if iframe.has_attr("hidden"):
-            flags["hidden_iframe"] = True
+        is_hidden = (
+            "display:none" in style
+            or "visibility:hidden" in style
+            or "opacity:0" in style
+            or iframe.has_attr("hidden")
+        )
+        if not is_hidden:
+            continue
+        flags["hidden_iframe"] = True
+        if is_suspicious_hidden_iframe(iframe, page_url):
+            metadata_signals["hidden_iframe"] = True
             break
 
     cert_age_days = None
     if parsed.scheme.lower() == "https" and parsed.hostname:
         try:
             cert_age_days = get_certificate_age_days(parsed.hostname)
-            flags["young_ssl_certificate"] = cert_age_days is not None and cert_age_days < 30
+            flags["young_ssl_certificate"] = cert_age_days is not None and cert_age_days < YOUNG_CERT_DAYS
         except Exception as exc:
             logger.info("SSL metadata unavailable for %s: %s", parsed.hostname, exc)
 
-    score = sum(1 for flagged in flags.values() if flagged) / len(flags)
+    score = 0.0
+    if flags["non_https_url"]:
+        score += 0.55
+    if metadata_signals["hidden_iframe"]:
+        score += 0.25
+    if flags["young_ssl_certificate"]:
+        score += 0.10
+
+    metadata_only_flag = flags["non_https_url"] and metadata_signals["hidden_iframe"]
     return {
-        "score": score,
-        "flagged": any(flags.values()),
+        "score": min(score, 1.0),
+        "flagged": metadata_only_flag,
         "details": {
             "flags": flags,
+            "signals": metadata_signals,
             "certificate_age_days": cert_age_days,
         },
     }
@@ -334,15 +370,24 @@ async def analyze(request: URLRequest):
     }
 
     risk_score = sum(breakdown[name]["score"] * WEIGHTS[name] for name in WEIGHTS)
-    any_flagged = any(result["flagged"] for result in breakdown.values())
-    is_harmful = any_flagged or risk_score >= HARMFUL_THRESHOLD
+    strong_signal_names = {
+        "text_toxicity",
+        "image_analysis",
+        "script_scanning",
+        "domain_reputation",
+    }
+    strong_signal_flagged = any(breakdown[name]["flagged"] for name in strong_signal_names)
+    metadata_supported = metadata_result["score"] >= 0.6 and (
+        script_result["flagged"] or domain_result["flagged"]
+    )
+    is_harmful = strong_signal_flagged or metadata_supported or risk_score >= HARMFUL_THRESHOLD
     reasons = build_reasons(breakdown)
 
     return {
         "risk_score": risk_score,
         "is_harmful": is_harmful,
         "threshold": HARMFUL_THRESHOLD,
-        "decision_rule": "flagged-signal-or-threshold",
+        "decision_rule": "strong-signal-or-supported-metadata-or-threshold",
         "weights": WEIGHTS,
         "reasons": reasons,
         "breakdown": breakdown,

@@ -209,7 +209,6 @@
 }
 
 .pill,
-.threshold-pill,
 .signal-status,
 .reason-tag {
   display: inline-flex;
@@ -222,11 +221,6 @@
 
 .pill {
   background: rgba(31, 27, 24, 0.08);
-}
-
-.threshold-pill {
-  background: rgba(255, 255, 255, 0.6);
-  color: var(--muted);
 }
 
 .score-value {

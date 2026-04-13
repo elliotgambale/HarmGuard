@@ -107,9 +107,6 @@ export default function App() {
                   <span className="pill">
                     {result.is_harmful ? 'Flagged' : 'Clear'}
                   </span>
-                  <span className="threshold-pill">
-                    Threshold {Number(result.threshold).toFixed(2)}
-                  </span>
                 </div>
                 <div className="score-value">{Number(result.risk_score).toFixed(3)}</div>
                 <h2>Overall Risk Score</h2>
